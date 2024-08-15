@@ -1,0 +1,1 @@
+Simple Discord Bot that Fetches Anime Episodes from the AniList  API and sends an alert. Responds to !hello / !upcoming / !setchannel {channel id} commands

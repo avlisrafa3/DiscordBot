@@ -1,0 +1,162 @@
+import os
+from dotenv import load_dotenv
+import discord
+from discord.ext import commands
+import requests
+from datetime import datetime, timedelta
+import schedule
+import time
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+# Load environment variables
+load_dotenv()
+token = os.getenv('DISCORD_BOT_TOKEN')
+
+# Define intents
+intents = discord.Intents.default()
+intents.message_content = True  # Enable the privilege to access message content
+
+# Define the bot with command prefix and intents
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# Dictionary to store announcement channels per server (you may want to use a database for persistence)
+announcement_channels = {}
+
+ANILIST_API_URL = "https://graphql.anilist.co"
+
+# Example GraphQL query to fetch upcoming anime
+def fetch_upcoming_anime():
+    url = ANILIST_API_URL
+    query = """
+    query($page: Int, $perPage: Int) {
+        Page(page: $page, perPage: $perPage) {
+            airingSchedules(notYetAired: true, sort: [TIME]) {
+                id
+                episode
+                airingAt
+                media {
+                    id
+                    title {
+                        romaji
+                        english
+                    }
+                }
+            }
+        }
+    }
+    """
+    variables = {
+        "page": 1,
+        "perPage": 10
+    }
+
+    try:
+        response = requests.post(url, json={'query': query, 'variables': variables})
+        response.raise_for_status()
+        data = response.json()
+        logging.debug(f"Received data: {data}")
+
+        if 'data' in data and 'Page' in data['data']:
+            return data['data']['Page']['airingSchedules']
+        else:
+            logging.error(f"Unexpected data format: {data}")
+            return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"API request failed: {e}")
+        return None
+
+# Send alert to Discord
+async def send_alert(guild_id, alert_message):
+    channel_id = announcement_channels.get(guild_id)
+    if not channel_id:
+        logging.error(f"No announcement channel set for guild {guild_id}.")
+        return
+
+    channel = bot.get_channel(channel_id)
+    if channel:
+        await channel.send(alert_message)
+    else:
+        logging.error(f"Channel with ID {channel_id} not found in guild {guild_id}.")
+
+# Schedule alerts
+def schedule_alerts():
+    upcoming_anime = fetch_upcoming_anime()
+    if upcoming_anime is None:
+        logging.error("Failed to fetch upcoming anime data. Skipping scheduling.")
+        return
+
+    for anime in upcoming_anime:
+        title = anime['media']['title']['romaji'] or anime['media']['title']['english']
+        airing_time = datetime.fromtimestamp(anime['airingAt'])
+        alert_message = f"{title} is airing at {airing_time.strftime('%Y-%m-%d %H:%M:%S')}"
+
+        # Schedule the alert for each guild
+        for guild_id in announcement_channels.keys():
+            schedule_time = airing_time.strftime("%H:%M")
+            schedule.every().day.at(schedule_time).do(lambda msg=alert_message, gid=guild_id:
+                                                      bot.loop.create_task(send_alert(gid, msg)))
+
+    logging.info("Scheduled alerts for upcoming anime.")
+
+@bot.event
+async def on_ready():
+    print(f'We have logged in as {bot.user}')
+    schedule_alerts()
+
+@bot.command(name='setchannel')
+@commands.has_permissions(administrator=True)
+async def set_channel(ctx, channel: discord.TextChannel):
+    """Sets the announcement channel for the bot."""
+    announcement_channels[ctx.guild.id] = channel.id
+    await ctx.send(f"Announcement channel set to {channel.mention}.")
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.errors.MissingPermissions):
+        await ctx.send("You don't have the required permissions to use this command.")
+    elif isinstance(error, commands.errors.BadArgument):
+        await ctx.send("Invalid argument. Please provide a valid channel.")
+    elif isinstance(error, commands.errors.CommandNotFound):
+        await ctx.send("Command not found.")
+    else:
+        await ctx.send("An error occurred. Please try again.")
+
+# Run the schedule in a separate thread
+def run_schedule():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+import threading
+
+schedule_thread = threading.Thread(target=run_schedule)
+schedule_thread.start()
+
+@bot.command(name='hello')
+async def hello(ctx):
+    """Responds with a greeting message."""
+    await ctx.send(f"Hello, {ctx.author.mention}! How can I assist you today?")
+
+@bot.command(name='upcoming')
+async def upcoming_anime(ctx):
+    """Fetches and sends a list of upcoming anime."""
+    upcoming_anime = fetch_upcoming_anime()
+    if upcoming_anime is None:
+        await ctx.send("Sorry, I couldn't fetch the upcoming anime schedule.")
+        return
+
+    if not upcoming_anime:
+        await ctx.send("No upcoming anime found.")
+        return
+
+    message = "Here are the upcoming anime:\n"
+    for anime in upcoming_anime:
+        title = anime['media']['title']['romaji'] or anime['media']['title']['english']
+        airing_time = datetime.fromtimestamp(anime['airingAt'])
+        message += f"- **{title}** (Episode {anime['episode']}) airing at {airing_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+
+    await ctx.send(message)
+
+bot.run(token)
